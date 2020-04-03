@@ -10,7 +10,7 @@ import (
 
 	"github.com/golang/protobuf/ptypes"
 	"github.com/pkg/errors"
-	"github.com/rodaine/grpc-chat/protos"
+	chat "github.com/rodaine/grpc-chat/protos"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -25,10 +25,10 @@ type server struct {
 
 	Broadcast chan chat.StreamResponse
 
-	ClientNames   map[string]string
-	ClientStreams map[string]chan chat.StreamResponse
-
-	namesMtx, streamsMtx sync.RWMutex
+	//ClientNames   map[string]string
+	ClientNames sync.Map
+	//ClientStreams map[string]chan chat.StreamResponse
+	ClientStreams sync.Map
 }
 
 func Server(host, pass string) *server {
@@ -38,8 +38,8 @@ func Server(host, pass string) *server {
 
 		Broadcast: make(chan chat.StreamResponse, 1000),
 
-		ClientNames:   make(map[string]string),
-		ClientStreams: make(map[string]chan chat.StreamResponse),
+		ClientNames:   sync.Map{},
+		ClientStreams: sync.Map{},
 	}
 }
 
@@ -96,9 +96,10 @@ func (s *server) Login(ctx context.Context, req *chat.LoginRequest) (*chat.Login
 
 	s.Broadcast <- chat.StreamResponse{
 		Timestamp: ptypes.TimestampNow(),
-		Event: &chat.StreamResponse_ClientLogin{&chat.StreamResponse_Login{
-			Name: req.Name,
-		}},
+		Event: &chat.StreamResponse_ClientLogin{
+			ClientLogin: &chat.StreamResponse_Login{
+				Name: req.Name,
+			}},
 	}
 
 	return &chat.LoginResponse{Token: tkn}, nil
@@ -114,9 +115,10 @@ func (s *server) Logout(ctx context.Context, req *chat.LogoutRequest) (*chat.Log
 
 	s.Broadcast <- chat.StreamResponse{
 		Timestamp: ptypes.TimestampNow(),
-		Event: &chat.StreamResponse_ClientLogout{&chat.StreamResponse_Logout{
-			Name: name,
-		}},
+		Event: &chat.StreamResponse_ClientLogout{
+			ClientLogout: &chat.StreamResponse_Logout{
+				Name: name,
+			}},
 	}
 
 	return new(chat.LogoutResponse), nil
@@ -145,10 +147,11 @@ func (s *server) Stream(srv chat.Chat_StreamServer) error {
 
 		s.Broadcast <- chat.StreamResponse{
 			Timestamp: ptypes.TimestampNow(),
-			Event: &chat.StreamResponse_ClientMessage{&chat.StreamResponse_Message{
-				Name:    name,
-				Message: req.Message,
-			}},
+			Event: &chat.StreamResponse_ClientMessage{
+				ClientMessage: &chat.StreamResponse_Message{
+					Name:    name,
+					Message: req.Message,
+				}},
 		}
 	}
 
@@ -183,42 +186,47 @@ func (s *server) sendBroadcasts(srv chat.Chat_StreamServer, tkn string) {
 
 func (s *server) broadcast(ctx context.Context) {
 	for res := range s.Broadcast {
-		s.streamsMtx.RLock()
-		for _, stream := range s.ClientStreams {
-			select {
-			case stream <- res:
-				// noop
-			default:
-				ServerLogf(time.Now(), "client stream full, dropping message")
-			}
-		}
-		s.streamsMtx.RUnlock()
+		wg := &sync.WaitGroup{}
+		s.ClientStreams.Range(func(key, val interface{}) bool {
+			wg.Add(1)
+			go func(h string, stream chan chat.StreamResponse) {
+				defer wg.Done()
+				done := make(chan struct{})
+				stream <- res
+				close(done)
+				t := time.NewTimer(time.Second)
+				select {
+				case <-t.C:
+					ServerLogf(time.Now(), "too slow response : %s", h)
+					// TODO
+					return
+				case <-done:
+					if !t.Stop() {
+						<-t.C
+						return
+					}
+				}
+			}(key.(string), val.(chan chat.StreamResponse))
+			return true
+		})
+		wg.Wait()
 	}
 }
 
 func (s *server) openStream(tkn string) (stream chan chat.StreamResponse) {
 	stream = make(chan chat.StreamResponse, 100)
-
-	s.streamsMtx.Lock()
-	s.ClientStreams[tkn] = stream
-	s.streamsMtx.Unlock()
-
+	s.ClientStreams.Store(tkn, stream)
 	DebugLogf("opened stream for client %s", tkn)
 
 	return
 }
 
 func (s *server) closeStream(tkn string) {
-	s.streamsMtx.Lock()
-
-	if stream, ok := s.ClientStreams[tkn]; ok {
-		delete(s.ClientStreams, tkn)
-		close(stream)
+	if stream, ok := s.ClientStreams.Load(tkn); ok {
+		s.ClientStreams.Delete(tkn)
+		close(stream.(chan chat.StreamResponse))
 	}
-
 	DebugLogf("closed stream for client %s", tkn)
-
-	s.streamsMtx.Unlock()
 }
 
 func (s *server) genToken() string {
@@ -227,29 +235,23 @@ func (s *server) genToken() string {
 	return fmt.Sprintf("%x", tkn)
 }
 
-func (s *server) getName(tkn string) (name string, ok bool) {
-	s.namesMtx.RLock()
-	name, ok = s.ClientNames[tkn]
-	s.namesMtx.RUnlock()
-	return
+func (s *server) getName(tkn string) (string, bool) {
+	name, ok := s.ClientNames.Load(tkn)
+	return name.(string), ok
 }
 
 func (s *server) setName(tkn string, name string) {
-	s.namesMtx.Lock()
-	s.ClientNames[tkn] = name
-	s.namesMtx.Unlock()
+	s.ClientNames.Store(tkn, name)
 }
 
-func (s *server) delName(tkn string) (name string, ok bool) {
-	name, ok = s.getName(tkn)
+func (s *server) delName(tkn string) (string, bool) {
+	name, ok := s.getName(tkn)
 
 	if ok {
-		s.namesMtx.Lock()
-		delete(s.ClientNames, tkn)
-		s.namesMtx.Unlock()
+		s.ClientNames.Delete(tkn)
 	}
 
-	return
+	return name, ok
 }
 
 func (s *server) extractToken(ctx context.Context) (tkn string, ok bool) {
